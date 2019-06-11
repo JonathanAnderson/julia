@@ -488,8 +488,9 @@ end
 function bind_client_port(s::TCPSocket)
     Sockets.iolock_begin()
     @assert s.status == Sockets.StatusInit
-    err = ccall(:jl_tcp_bind, Int32, (Ptr{Cvoid}, UInt16, UInt32, Cuint),
-                s.handle, hton(client_port[]), hton(UInt32(0)), 0)
+    host_in = Ref(hton(UInt32(0))) # IPv4 0.0.0.0
+    err = ccall(:jl_tcp_bind, Int32, (Ptr{Cvoid}, UInt16, Ptr{Cvoid}, Cuint, Cint),
+                s, hton(client_port[]), host_in, 0, false)
     Sockets.iolock_end()
     uv_error("tcp_bind", err)
 

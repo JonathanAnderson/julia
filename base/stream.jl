@@ -927,15 +927,19 @@ end
 uv_write(s::LibuvStream, p::Vector{UInt8}) = uv_write(s, pointer(p), UInt(sizeof(p)))
 
 function uv_write(s::LibuvStream, p::Ptr{UInt8}, n::UInt)
+    iolock_begin()
+    uvw = uv_write_async(s, p, n)
     ct = current_task()
-    uvw = uv_write_async(s, p, n, ct)
     preserve_handle(ct)
-    try
+    uv_req_set_data(uvw, ct)
+    iolock_end()
+    status = try
         # wait for the last chunk to complete (or error)
         # assume that any errors would be sticky,
         # (so we don't need to monitor the error status of the intermediate writes)
-        wait()
+        wait()::Cint
     finally
+        iolock_begin()
         if uv_req_data(uvw) != C_NULL
             # uvw is still alive,
             # so make sure we won't get spurious notifications later
@@ -944,20 +948,24 @@ function uv_write(s::LibuvStream, p::Ptr{UInt8}, n::UInt)
             # done with uvw
             Libc.free(uvw)
         end
+        iolock_end()
         unpreserve_handle(ct)
     end
-    return Int(n)
+    if status < 0
+        throw(_UVError("write", status))
+    end
+    return Int(status)
 end
 
 # helper function for uv_write that returns the uv_write_t struct for the write
-# rather than waiting on it
-function uv_write_async(s::LibuvStream, p::Ptr{UInt8}, n::UInt, reqdata)
+# rather than waiting on it, caller must hold the iolock
+function uv_write_async(s::LibuvStream, p::Ptr{UInt8}, n::UInt)
     check_open(s)
     while true
         uvw = Libc.malloc(_sizeof_uv_write)
-        uv_req_set_data(uvw, reqdata)
+        uv_req_set_data(uvw, C_NULL) # in case we get interrupted before arriving at the wait call
         nwrite = min(n, MAX_OS_WRITE) # split up the write into chunks the OS can handle.
-        # TODO: use writev, when that is added to uv-win
+        # TODO: use writev instead of a loop
         err = ccall(:jl_uv_write,
                     Int32,
                     (Ptr{Cvoid}, Ptr{Cvoid}, UInt, Ptr{Cvoid}, Ptr{Cvoid}),
@@ -1035,12 +1043,7 @@ function uv_writecb_task(req::Ptr{Cvoid}, status::Cint)
     if d != C_NULL
         uv_req_set_data(req, C_NULL) # let the Task know we got the writecb
         t = unsafe_pointer_to_objref(d)::Task
-        if status < 0
-            err = _UVError("write", status)
-            schedule(t, err, error=true)
-        else
-            schedule(t)
-        end
+        schedule(t, status)
     else
         # no owner for this req, safe to just free it
         Libc.free(req)

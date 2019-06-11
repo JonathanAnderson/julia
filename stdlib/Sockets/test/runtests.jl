@@ -242,41 +242,55 @@ end
         bind(b, ip"127.0.0.1", randport + 1)
 
         @sync begin
-            # FIXME: check that we received all messages
-            for i = 1:3
-                @async send(b, ip"127.0.0.1", randport, "Hello World")
-                @async String(recv(a)) == "Hello World"
+            let i = 0
+                for _ = 1:30
+                    @async let msg = String(recv(a))
+                        @test msg == "Hello World $(i += 1)"
+                    end
+                end
+            end
+            yield()
+            for i = 1:30
+                send(b, ip"127.0.0.1", randport, "Hello World $i")
             end
         end
 
-        tsk = @async send(b, ip"127.0.0.1", randport, "Hello World")
-        (addr, data) = recvfrom(a)
-        @test addr == ip"127.0.0.1" && String(data) == "Hello World"
-        wait(tsk)
+        let msg = Vector{UInt8}("1234"^16377)
+            @test_throws(Base._UVError("send", Base.UV_EMSGSIZE),
+                         send(b, ip"127.0.0.1", randport, msg))
+            pop!(msg)
+            tsk = @async @test recv(a) == msg
+            @test send(b, ip"127.0.0.1", randport, msg) === nothing
+            wait(tsk)
+        end
+
+        let tsk = @async send(b, ip"127.0.0.1", randport, "WORLD HELLO")
+            (addr, data) = recvfrom(a)
+            @test addr == ip"127.0.0.1" && String(data) == "WORLD HELLO"
+            wait(tsk)
+        end
         close(a)
         close(b)
     end
 
     @test_throws MethodError bind(UDPSocket(), randport)
 
-    if !Sys.iswindows() || Sys.windows_version() >= Sys.WINDOWS_VISTA_VER
     let
         a = UDPSocket()
         b = UDPSocket()
         bind(a, ip"::1", UInt16(randport))
         bind(b, ip"::1", UInt16(randport + 1))
 
-        tsk = @async begin
-            @test begin
-                (addr, data) = recvfrom(a)
-                addr == ip"::1" && String(data) == "Hello World"
+        for i = 1:3
+            tsk = @async begin
+                let (addr, data) = recvfrom(a)
+                    @test addr == ip"::1"
+                    @test String(data) == "Hello World"
+                end
             end
+            send(b, ip"::1", randport, "Hello World")
+            wait(tsk)
         end
-        send(b, ip"::1", randport, "Hello World")
-        wait(tsk)
-        send(b, ip"::1", randport, "Hello World")
-        wait(tsk)
-    end
     end
 end
 
