@@ -326,35 +326,6 @@ function check_open(x::Union{LibuvStream, LibuvServer})
     end
 end
 
-function wait_readbyte(x::LibuvStream, c::UInt8)
-    iolock_begin()
-    if !isopen(x) || occursin(c, x.buffer) # fast path
-        iolock_end()
-        return
-    end
-    preserve_handle(x)
-    lock(x.cond)
-    try
-        while isopen(x) && !occursin(c, x.buffer)
-            x.readerror === nothing || throw(x.readerror)
-            start_reading(x) # ensure we are reading
-            iolock_end()
-            wait(x.cond)
-            unlock(x.cond)
-            iolock_begin()
-            lock(x.cond)
-        end
-    finally
-        if isempty(x.cond)
-            stop_reading(x) # stop reading iff there are currently no other read clients of the stream
-        end
-        unpreserve_handle(x)
-        unlock(x.cond)
-    end
-    iolock_end()
-    nothing
-end
-
 function wait_readnb(x::LibuvStream, nb::Int)
     iolock_begin()
     if !isopen(x) || bytesavailable(x.buffer) >= nb # fast path
@@ -390,27 +361,22 @@ function wait_readnb(x::LibuvStream, nb::Int)
 end
 
 function wait_close(x::Union{LibuvStream, LibuvServer})
-    iolock_begin()
     preserve_handle(x)
     lock(x.cond)
     try
         while isopen(x)
-            iolock_end()
             wait(x.cond)
-            unlock(x.cond)
-            iolock_begin()
-            lock(x.cond)
         end
     finally
         unlock(x.cond)
         unpreserve_handle(x)
     end
-    iolock_end()
     nothing
 end
 
 function close(stream::Union{LibuvStream, LibuvServer})
     iolock_begin()
+    should_wait = false
     if stream.status == StatusInit
         ccall(:jl_forceclose_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
         stream.status = StatusClosing
@@ -420,9 +386,9 @@ function close(stream::Union{LibuvStream, LibuvServer})
             ccall(:jl_close_uv, Cvoid, (Ptr{Cvoid},), stream.handle)
             stream.status = StatusClosing
         end
-        should_wait && wait_close(stream)
     end
     iolock_end()
+    should_wait && wait_close(stream)
     nothing
 end
 
@@ -824,7 +790,7 @@ function readbytes!(s::LibuvStream, a::Vector{UInt8}, nb::Int)
         return nread
     end
 
-    try
+    nread = try
         stop_reading(s) # Just playing it safe, since we are going to switch buffers.
         newbuf = PipeBuffer(a, maxsize = nb)
         newbuf.size = 0 # reset the write pointer to the beginning
@@ -834,15 +800,15 @@ function readbytes!(s::LibuvStream, a::Vector{UInt8}, nb::Int)
         wait_readnb(s, Int(nb))
         iolock_begin()
         compact(newbuf)
-        nread = bytesavailable(newbuf)
-        return nread
+        bytesavailable(newbuf)
     finally
         s.buffer = sbuf
         if !isempty(s.cond)
             start_reading(s) # resume reading iff there are currently other read clients of the stream
         end
-        iolock_end()
     end
+    iolock_end()
+    return nread
 end
 
 function read(stream::LibuvStream)
@@ -914,11 +880,31 @@ function readavailable(this::LibuvStream)
     return bytes
 end
 
-function readuntil(this::LibuvStream, c::UInt8; keep::Bool=false)
+function readuntil(x::LibuvStream, c::UInt8; keep::Bool=false)
     iolock_begin()
-    wait_readbyte(this, c)
-    buf = this.buffer
+    buf = x.buffer
     @assert buf.seekable == false
+    if isopen(x) && !occursin(c, buf) # fast path
+        preserve_handle(x)
+        lock(x.cond)
+        try
+            while isopen(x) && !occursin(c, x.buffer)
+                x.readerror === nothing || throw(x.readerror)
+                start_reading(x) # ensure we are reading
+                iolock_end()
+                wait(x.cond)
+                unlock(x.cond)
+                iolock_begin()
+                lock(x.cond)
+            end
+        finally
+            if isempty(x.cond)
+                stop_reading(x) # stop reading iff there are currently no other read clients of the stream
+            end
+            unlock(x.cond)
+            unpreserve_handle(x)
+        end
+    end
     bytes = readuntil(buf, c, keep=keep)
     iolock_end()
     return bytes
@@ -926,8 +912,8 @@ end
 
 uv_write(s::LibuvStream, p::Vector{UInt8}) = uv_write(s, pointer(p), UInt(sizeof(p)))
 
+# caller must have acquired the iolock
 function uv_write(s::LibuvStream, p::Ptr{UInt8}, n::UInt)
-    iolock_begin()
     uvw = uv_write_async(s, p, n)
     ct = current_task()
     preserve_handle(ct)
@@ -954,7 +940,7 @@ function uv_write(s::LibuvStream, p::Ptr{UInt8}, n::UInt)
     if status < 0
         throw(_UVError("write", status))
     end
-    return Int(status)
+    return Int(n)
 end
 
 # helper function for uv_write that returns the uv_write_t struct for the write
@@ -989,23 +975,24 @@ end
 # - large isbits arrays are unbuffered and written directly
 
 function unsafe_write(s::LibuvStream, p::Ptr{UInt8}, n::UInt)
-    if s.sendbuf === nothing
-        return uv_write(s, p, UInt(n))
-    end
-
-    buf = s.sendbuf
-    totb = bytesavailable(buf) + n
-    if totb < buf.maxsize
-        nb = unsafe_write(buf, p, n)
-    else
-        flush(s)
-        if n > buf.maxsize
-            nb = uv_write(s, p, n)
-        else
+    while true
+        # try to add to the send buffer
+        iolock_begin()
+        buf = s.sendbuf
+        buf === nothing && break
+        totb = bytesavailable(buf) + n
+        if totb < buf.maxsize
             nb = unsafe_write(buf, p, n)
+            iolock_end()
+            return nb
         end
+        bytesavailable(buf) == 0 && break
+        # perform flush(s)
+        arr = take!(buf)
+        uv_write(s, arr)
     end
-    return nb
+    # perform the output to the kernel
+    return uv_write(s, p, n)
 end
 
 function flush(s::LibuvStream)
@@ -1013,27 +1000,34 @@ function flush(s::LibuvStream)
     buf = s.sendbuf
     if buf !== nothing
         if bytesavailable(buf) > 0
-            arr = take!(buf)        # Array of UInt8s
+            arr = take!(buf)
             uv_write(s, arr)
-            iolock_end()
             return
         end
     end
     uv_write(s, Ptr{UInt8}(Base.eventloop()), UInt(0)) # zero write from a random pointer to flush current queue
-    iolock_end()
     return
 end
 
-buffer_writes(s::LibuvStream, bufsize) = (s.sendbuf = PipeBuffer(bufsize); s)
+function buffer_writes(s::LibuvStream, bufsize)
+    sendbuf = PipeBuffer(bufsize)
+    iolock_begin()
+    s.sendbuf = sendbuf
+    iolock_end()
+    return s
+end
 
 ## low-level calls to libuv ##
 
 function write(s::LibuvStream, b::UInt8)
     buf = s.sendbuf
     if buf !== nothing
+        iolock_begin()
         if bytesavailable(buf) + 1 < buf.maxsize
+            iolock_end()
             return write(buf, b)
         end
+        iolock_end()
     end
     return write(s, Ref{UInt8}(b))
 end
@@ -1245,14 +1239,16 @@ function wait_readnb(s::BufferStream, nb::Int)
     end
 end
 
-show(io::IO, s::BufferStream) = print(io,"BufferStream() bytes waiting:",bytesavailable(s.buffer),", isopen:", s.is_open)
+show(io::IO, s::BufferStream) = print(io, "BufferStream() bytes waiting:", bytesavailable(s.buffer), ", isopen:", s.is_open)
 
-function wait_readbyte(s::BufferStream, c::UInt8)
-    lock(s.cond) do
+function readuntil(s::BufferStream, c::UInt8; keep::Bool=false)
+    bytes = lock(s.cond) do
         while isopen(s) && !occursin(c, s.buffer)
             wait(s.cond)
         end
+        readuntil(s.buffer, c, keep=keep)
     end
+    return bytes
 end
 
 function wait_close(s::BufferStream)

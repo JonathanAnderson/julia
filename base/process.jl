@@ -999,14 +999,16 @@ function wait(x::Process)
     if !process_exited(x)
         preserve_handle(x)
         lock(x.exitnotify)
+        iolock_end()
         try
             wait(x.exitnotify)
         finally
             unlock(x.exitnotify)
             unpreserve_handle(x)
         end
+    else
+        iolock_end()
     end
-    iolock_end()
     nothing
 end
 

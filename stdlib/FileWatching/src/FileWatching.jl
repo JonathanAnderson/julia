@@ -168,6 +168,7 @@ mutable struct _FDWatcher
                 elseif FDWatchers[fdnum] !== nothing
                     this = FDWatchers[fdnum]::_FDWatcher
                     this.refcount = (this.refcount[1] + Int(readable), this.refcount[2] + Int(writable))
+                    iolock_end()
                     return this
                 end
                 if ccall(:jl_uv_unix_fd_is_watched, Int32, (RawFD, Ptr{Cvoid}, Ptr{Cvoid}), fd, C_NULL, eventloop()) == 1

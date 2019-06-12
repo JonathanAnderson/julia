@@ -664,8 +664,8 @@ function accept(server::LibuvServer, client::LibuvStream)
         end
         preserve_handle(server)
         lock(server.cond)
+        iolock_end()
         try
-            iolock_end()
             wait(server.cond)
         finally
             unlock(server.cond)
